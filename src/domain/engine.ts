@@ -1,12 +1,16 @@
 import type {
+  AlertCheck,
+  AlertLevel,
   BroadcastRecord,
   ChildProfile,
   CrowdLevel,
   CrowdReport,
   DeskCheck,
+  DiversionChannel,
   ExitInterception,
   Incident,
   IncidentStage,
+  IntermissionAlert,
   PatrolCheck,
   ReviewSuggestion,
   ShowReview,
@@ -80,10 +84,12 @@ export function zoneDistance(a: Zone, b: Zone): number {
 const CROWD_SCORE: Record<CrowdLevel, number> = { low: 0, medium: 1, high: 2 }
 
 export function crowdLevelOf(reports: CrowdReport[], zoneId: string, now: number): CrowdLevel {
-  // 取该区域 10 分钟内最新一次上报
-  const latest = reports
-    .filter((r) => r.zoneId === zoneId && now - r.at <= 10 * 60 * 1000)
-    .sort((a, b) => b.at - a.at)[0]
+  // 取该区域 10 分钟内最新一次上报（时间戳相同时以后写入者为准）
+  let latest: CrowdReport | undefined
+  for (const r of reports) {
+    if (r.zoneId !== zoneId || now - r.at > 10 * 60 * 1000) continue
+    if (!latest || r.at >= latest.at) latest = r
+  }
   return latest?.level ?? 'low'
 }
 
@@ -113,6 +119,300 @@ export function recommendPatrolZones(
     .sort((a, b) => b.priorityScore - a.priorityScore)
 }
 
+/** ---------- 中场休息高风险预警 ---------- */
+
+/** 周边功能区纳入拥堵考量的半径（地图百分比坐标） */
+export const ALERT_FACILITY_RADIUS = 42
+/** 预警巡查记录在报案后仍可用于缩小搜寻范围的时效（分钟） */
+export const ALERT_SIGHTING_TTL = 20
+
+/** 距目标区域最近的出口 */
+export function nearestExit(zones: Zone[], target: Zone): Zone | undefined {
+  return zones
+    .filter((z) => z.type === 'exit')
+    .map((z) => ({ z, d: zoneDistance(z, target) }))
+    .sort((a, b) => a.d - b.d)[0]?.z
+}
+
+/** 目标区域周边的功能区（按距离升序） */
+export function nearbyFacilities(zones: Zone[], target: Zone, radius = ALERT_FACILITY_RADIUS) {
+  return zones
+    .filter((z) => z.type === 'facility')
+    .map((z) => ({ zone: z, dist: zoneDistance(z, target) }))
+    .filter((x) => x.dist <= radius)
+    .sort((a, b) => a.dist - b.dist)
+}
+
+export interface AlertScore {
+  score: number
+  level: AlertLevel
+  factors: string[]
+  crowdedZoneIds: string[]
+  crowdLevel: CrowdLevel
+  leftSeatChildIds: string[]
+}
+
+/** 座位分区的场馆几何上下文（距最近出口、周边功能区） */
+export interface AlertGeoContext {
+  exit: { zone: Zone; dist: number }
+  nearby: { zone: Zone; dist: number }[]
+}
+
+export function alertGeoContext(zones: Zone[], target: Zone): AlertGeoContext {
+  const exit = nearestExit(zones, target)
+  return {
+    exit: exit ? { zone: exit, dist: zoneDistance(exit, target) } : { zone: target, dist: 999 },
+    nearby: nearbyFacilities(zones, target),
+  }
+}
+
+/**
+ * 中场巡查优先级评分（按座位分区聚合）：
+ * 儿童年龄（越小越高）+ 座位距出口远近（越远越高）+ 单人带娃户数
+ * + 中场报备离座未归人数 + 周边厕所/卖品/互动区拥堵程度。
+ */
+export function scoreIntermissionAlert(
+  children: ChildProfile[],
+  reports: CrowdReport[],
+  geo: AlertGeoContext,
+  now: number
+): AlertScore {
+  let score = 0
+  const factors: string[] = []
+
+  // —— 儿童年龄 ——
+  const under4 = children.filter((c) => c.age <= 4)
+  const preschool = children.filter((c) => c.age > 4 && c.age <= 6)
+  const agePts = Math.min(12, under4.length * 5 + preschool.length * 3)
+  if (agePts > 0) {
+    const ageBits: string[] = []
+    if (under4.length) ageBits.push(`≤4 岁 ${under4.length} 名（${under4.map((c) => c.nickname).join('、')}）`)
+    if (preschool.length) ageBits.push(`5-6 岁 ${preschool.length} 名`)
+    score += agePts
+    factors.push(`低龄儿童集中：${ageBits.join('、')}`)
+  }
+
+  // —— 单人带娃 ——
+  const single = children.filter((c) => c.guardians.length <= 1)
+  const singlePts = Math.min(9, single.length * 3)
+  if (singlePts > 0) {
+    score += singlePts
+    factors.push(`单人带娃 ${single.length} 户（${single.map((c) => c.nickname).join('、')}），无替补看护人`)
+  }
+
+  // —— 中场报备离座未归 ——
+  const leftSeat = children.filter((c) => c.leftSeatAt && !c.returnedAt)
+  const leftPts = Math.min(16, leftSeat.length * 8)
+  if (leftPts > 0) {
+    score += leftPts
+    factors.push(
+      `中场报备离座未归 ${leftSeat.length} 名（${leftSeat.map((c) => c.nickname).join('、')}）` +
+        `，最近 ${leftSeat.map((c) => minutesAgo(c.leftSeatAt!, now)).sort((a, b) => a - b)[0]} 分钟前`
+    )
+  }
+
+  // —— 座位距最近出口 ——
+  const d = geo.exit.dist
+  if (d >= 40) {
+    score += 8
+    factors.push(`距最近出口较远（${geo.exit.zone.shortName}，直线距离 ${Math.round(d)}），独行儿童不易自行折返`)
+  } else if (d >= 28) {
+    score += 4
+    factors.push(`距最近出口中等距离（${geo.exit.zone.shortName}，直线距离 ${Math.round(d)}）`)
+  } else {
+    factors.push(`紧邻${geo.exit.zone.shortName}（直线距离 ${Math.round(d)}），离场通道短`)
+  }
+
+  // —— 周边厕所/卖品/互动区拥堵（高拥堵优先，同级按距离） ——
+  const crowded = geo.nearby
+    .map((n) => ({ ...n, level: crowdLevelOf(reports, n.zone.id, now) }))
+    .filter((n) => n.level !== 'low')
+    .sort((a, b) => CROWD_SCORE[b.level] - CROWD_SCORE[a.level] || a.dist - b.dist)
+  if (crowded.length) {
+    const top = crowded[0]
+    const topPts = top.level === 'high' ? 16 : 8
+    const extraPts = Math.min(4, crowded.slice(1).length * 2)
+    score += topPts + extraPts
+    factors.push(
+      `周边「${crowded.map((n) => n.zone.shortName).join('」「')}」人流` +
+        `${crowded.some((n) => n.level === 'high') ? '拥挤' : '较挤'}，儿童易被人流冲散`
+    )
+  }
+
+  const topLevel: CrowdLevel = crowded.some((n) => n.level === 'high')
+    ? 'high'
+    : crowded.some((n) => n.level === 'medium')
+      ? 'medium'
+      : 'low'
+  const level: AlertLevel = score >= 26 ? 'high' : score >= 15 ? 'medium' : 'low'
+  return {
+    score,
+    level,
+    factors,
+    crowdedZoneIds: crowded.map((n) => n.zone.id),
+    crowdLevel: topLevel,
+    leftSeatChildIds: leftSeat.map((c) => c.id),
+  }
+}
+
+/** 依据当前状态重算全部座位分区的中场预警（不保留历史，历史由 reconcile 合并） */
+export function buildIntermissionAlerts(
+  zones: Zone[],
+  childrenByZone: Map<string, ChildProfile[]>,
+  reports: CrowdReport[],
+  showId: string,
+  now: number
+): IntermissionAlert[] {
+  return zones
+    .filter((z) => z.type === 'seat')
+    .map((z) => {
+      const kids = childrenByZone.get(z.id) ?? []
+      const s = scoreIntermissionAlert(kids, reports, alertGeoContext(zones, z), now)
+      return {
+        id: `ALERT-${z.id}`,
+        showId,
+        zoneId: z.id,
+        level: s.level,
+        score: s.score,
+        factors: s.factors,
+        childIds: kids.map((c) => c.id),
+        crowdedZoneIds: s.crowdedZoneIds,
+        crowdLevel: s.crowdLevel,
+        leftSeatChildIds: s.leftSeatChildIds,
+        confirmCount: 0,
+        triggerCount: s.level === 'low' ? 0 : 1,
+        checks: [],
+        dismissed: false,
+        createdAt: now,
+        updatedAt: now,
+      } satisfies IntermissionAlert
+    })
+    .filter((a) => a.childIds.length > 0)
+    .sort((a, b) => b.score - a.score)
+}
+
+/**
+ * 用最新评分合并历史预警：保留巡查反馈/确认次数；
+ * 预警等级进入中/高或再次升级时累计"触发次数"；
+ * 被人工解除的预警仅在重新升至高风险时复活。
+ */
+export function reconcileAlerts(
+  previous: IntermissionAlert[],
+  fresh: IntermissionAlert[],
+  now: number
+): IntermissionAlert[] {
+  return fresh.map((f) => {
+    const prev = previous.find((p) => p.zoneId === f.zoneId)
+    if (!prev) return f
+    const rank: Record<AlertLevel, number> = { low: 0, medium: 1, high: 2 }
+    // 仅在等级较上一轮升高时累计一次触发（低→中/高、中→高）
+    const upgraded = rank[f.level] > rank[prev.level]
+    const revive = prev.dismissed && f.level === 'high'
+    return {
+      ...f,
+      id: prev.id,
+      checks: prev.checks,
+      confirmCount: prev.confirmCount,
+      lastConfirmedAt: prev.lastConfirmedAt,
+      triggerCount: prev.triggerCount + (upgraded ? 1 : 0),
+      dismissed: prev.dismissed && !revive,
+      createdAt: prev.createdAt,
+      updatedAt: now,
+    }
+  })
+}
+
+/**
+ * 报案时筛选可带入找回事件的中场巡查记录：
+ * 距最后出现位置不远、且在时效内；场务确认拥挤的记录不受距离限制（属于强线索）。
+ */
+export function selectAlertSightings(
+  checks: AlertCheck[],
+  zonesById: Map<string, Zone>,
+  lastSeen: Zone,
+  now: number
+): AlertCheck[] {
+  return checks
+    .filter((c) => now - c.at <= ALERT_SIGHTING_TTL * 60 * 1000)
+    .map((c) => ({ c, z: zonesById.get(c.zoneId) }))
+    .filter((x): x is { c: AlertCheck; z: Zone } => !!x.z)
+    .filter((x) => x.c.crowded || zoneDistance(x.z, lastSeen) <= ALERT_FACILITY_RADIUS + 6)
+    .sort((a, b) => Number(b.c.crowded) - Number(a.c.crowded) || b.c.at - a.c.at)
+    .slice(0, 6)
+    .map((x) => x.c)
+}
+
+/** 依据预警与已确认拥挤记录，生成/维持安保端临时分流通道 */
+export function planDiversions(args: {
+  alerts: IntermissionAlert[]
+  zones: Zone[]
+  existing: DiversionChannel[]
+  showId: string
+  now: number
+}): DiversionChannel[] {
+  const { alerts, zones, existing, showId, now } = args
+  const out: DiversionChannel[] = []
+  for (const alert of alerts) {
+    const sourceId = alert.crowdedZoneIds[0]
+    if (!sourceId || alert.confirmCount === 0 || alert.dismissed || alert.level === 'low') continue
+    const source = zones.find((z) => z.id === sourceId)!
+    const exit = nearestExit(zones, source)
+    if (!exit) continue
+    const kept = existing.find((d) => d.alertId === alert.id)
+    if (kept) {
+      if (kept.active) out.push(kept)
+      continue
+    }
+    out.push({
+      id: `DIV-${alert.zoneId}`,
+      showId,
+      zoneId: source.id,
+      exitId: exit.id,
+      alertId: alert.id,
+      reason: `场务确认「${source.name}」拥挤 ${alert.confirmCount} 次，临时分流观众改走${exit.name}`,
+      active: true,
+      createdAt: now,
+    })
+  }
+  return out
+}
+
+/** 多次触发的预警区域 → 下一场排班与指示牌位置建议 */
+export function alertBasedReviewSuggestions(alerts: IntermissionAlert[], zonesById: Map<string, Zone>): ReviewSuggestion[] {
+  const hot = alerts
+    .filter((a) => a.triggerCount >= 2)
+    .sort((a, b) => b.triggerCount - a.triggerCount || b.confirmCount - a.confirmCount)
+  if (!hot.length) return []
+  const suggestions: ReviewSuggestion[] = []
+  const staffing = hot.slice(0, 2)
+  if (staffing.length) {
+    suggestions.push({
+      id: 's-alert-staffing',
+      area: 'staffing',
+      text:
+        `下一场中场在${staffing.map((a) => zonesById.get(a.zoneId)?.shortName).join('、')}周边固定 1 名场务` +
+        `并提前 2 分钟到位，每 5 分钟回传人流；该区域预警本场被反复触发，列入中场巡查首发点位。`,
+      basedOn: staffing.map((a) => `${zonesById.get(a.zoneId)?.shortName}预警触发 ${a.triggerCount} 次`).join('，'),
+    })
+  }
+  const signZones = hot.filter((a) => a.confirmCount > 0).slice(0, 2)
+  const zoneNames = new Set<string>()
+  for (const a of signZones) for (const zid of a.crowdedZoneIds) zoneNames.add(zid)
+  if (zoneNames.size) {
+    suggestions.push({
+      id: 's-alert-signage',
+      area: 'signage',
+      text:
+        `下一场在${[...zoneNames].map((z) => zonesById.get(z)?.name).join('、')}入口处增设临时指示牌` +
+        `（排队方向 / 备用通道 / "牵手同行"提示），中场开始即摆放、散场前回收；指示牌位置同步给当班安保。`,
+      basedOn: signZones
+        .map((a) => `${zonesById.get(a.zoneId)?.shortName}周边被场务确认拥挤 ${a.confirmCount} 次`)
+        .join('，'),
+    })
+  }
+  return suggestions
+}
+
 /** ---------- 找回任务生成 ---------- */
 
 export interface SearchZone {
@@ -124,13 +424,24 @@ export interface SearchZone {
 /**
  * 搜寻分区：以最后出现位置为圆心，优先拥挤区域与厕所/卖品/互动区，
  * 并始终包含座位分区。
+ *
+ * 若带入中场预警巡查记录（sightings）：场务确认拥挤的区域显著加权，
+ * 用以收窄"最后出现范围"；刚巡查且人流正常的区域适度降权。
  */
 export function planSearchZones(
   zones: Zone[],
   lastSeen: Zone,
   reports: CrowdReport[],
-  now: number
+  now: number,
+  sightings?: AlertCheck[]
 ): SearchZone[] {
+  const recentCrowded = new Map<string, number>()
+  const recentClear = new Map<string, number>()
+  for (const c of sightings ?? []) {
+    if (now - c.at > ALERT_SIGHTING_TTL * 60 * 1000) continue
+    const m = c.crowded ? recentCrowded : recentClear
+    m.set(c.zoneId, Math.max(m.get(c.zoneId) ?? 0, c.at))
+  }
   const candidates = zones.filter((z) => ['facility', 'seat', 'exit'].includes(z.type))
   return candidates
     .map((z) => {
@@ -146,6 +457,14 @@ export function planSearchZones(
       if (z.type === 'facility') {
         score += crowd * 12
         if (crowd === 2) reasons.push('当前人流拥挤，儿童易滞留')
+      }
+      if (recentCrowded.has(z.id)) {
+        score += 26
+        reasons.push(`中场巡查 ${minutesAgo(recentCrowded.get(z.id)!, now)} 分钟前确认拥挤，纳入重点`)
+      }
+      if (recentClear.has(z.id) && z.id !== lastSeen.id) {
+        score -= 10
+        reasons.push(`中场巡查 ${minutesAgo(recentClear.get(z.id)!, now)} 分钟前人流正常，降低优先级`)
       }
       if (z.type === 'exit') {
         score += 8
@@ -324,7 +643,11 @@ const STAGE_LABEL: Record<IncidentStage, string> = {
   exit: '散场',
 }
 
-export function reviewShow(incidents: Incident[]): ShowReview {
+export function reviewShow(
+  incidents: Incident[],
+  alerts: IntermissionAlert[] = [],
+  zonesById?: Map<string, Zone>
+): ShowReview {
   const showId = incidents[0]?.showId ?? ''
   const stages: IncidentStage[] = ['entry', 'intermission', 'exit']
   const byStage = stages.map((stage) => ({
@@ -377,6 +700,12 @@ export function reviewShow(incidents: Incident[]): ShowReview {
         ex.count > 0 ? `${ex.count} 起走失发生在散场阶段` : '存在未找到即散场的事件，出口拦截压力大',
     })
   }
+
+  // 中场预警被反复触发的区域 → 下一场排班与临时指示牌
+  if (alerts.length && zonesById) {
+    suggestions.push(...alertBasedReviewSuggestions(alerts, zonesById))
+  }
+
   if (suggestions.length === 0) {
     suggestions.push({
       id: 's-keep',

@@ -80,6 +80,17 @@ const activeExitIds = computed(() => {
   return selected.value.interceptions.filter((x) => x.active).map((x) => x.zoneId)
 })
 
+// ---------- 中场预警触发的临时分流通道 ----------
+const diversionNotes = reactive<Record<string, string>>({})
+function closeDiversion(d: { id: string }) {
+  if (!diversionNotes[d.id]?.trim()) return toast.push('请填写疏导处置说明后再关闭通道', 'critical')
+  store.closeDiversion(d.id, diversionNotes[d.id].trim(), role.staffId)
+  toast.push('临时分流通道已关闭并回传场务端', 'good')
+}
+function diversionMapLayers() {
+  return store.activeDiversions.map((d) => ({ zoneId: d.zoneId, exitId: d.exitId, active: d.active }))
+}
+
 const mySelectedTasks = computed(() =>
   selected.value ? myTasks.value.filter((x) => x.i.id === selected.value!.id) : []
 )
@@ -97,6 +108,44 @@ const mySelectedTasks = computed(() =>
         {{ me.status === 'busy' ? '执行任务中' : '岗哨待命' }}
       </span>
       <span class="muted small-text">当前位置：{{ ZONES_BY_ID.get(me.zoneId)?.name }}</span>
+    </div>
+
+    <!-- 中场预警触发的临时分流通道（无走失事件时也显示） -->
+    <div v-if="['intermission', 'exit'].includes(store.show.phase)" class="card" :class="store.activeDiversions.length ? 'pulse' : ''" style="border-color:#e7c8c8">
+      <div class="card-title">
+        <h2>🔀 临时分流通道</h2>
+        <span class="hint">场务在中场高风险预警中「确认区域拥挤」后同步生成，用于快速分流观众、冲散拥堵点</span>
+        <span class="tag-pill" :class="store.activeDiversions.length ? 'pill-critical' : 'pill-good'">
+          {{ store.activeDiversions.length }} 条生效中
+        </span>
+      </div>
+      <div v-if="!store.activeDiversions.length" class="empty">
+        当前没有临时分流通道。中场休息期间若场务确认厕所/卖品区拥挤，对应通道会自动出现在这里。
+      </div>
+      <div v-for="d in store.activeDiversions" :key="d.id" class="list-row" style="align-items:flex-start">
+        <span class="dot dot-critical" style="margin-top:5px"></span>
+        <div style="flex:1">
+          <div class="row">
+            <strong>{{ ZONES_BY_ID.get(d.zoneId)?.name }} → {{ ZONES_BY_ID.get(d.exitId)?.name }}</strong>
+            <span class="tag-pill pill-critical">分流中</span>
+            <span class="muted small-text mono">{{ formatTime(d.createdAt) }} 建立</span>
+          </div>
+          <div class="small-text muted" style="margin:4px 0">{{ d.reason }}</div>
+          <div class="row" style="gap:8px">
+            <button class="small" @click="moveHere(d.exitId)">到{{ ZONES_BY_ID.get(d.exitId)?.shortName }}打卡</button>
+            <input v-model="diversionNotes[d.id]" placeholder="疏导处置说明，如：已拉隔离带、引导排队改道" style="flex:1;min-width:220px" />
+            <button class="small good" @click="closeDiversion(d)">人流回落，关闭通道</button>
+          </div>
+        </div>
+      </div>
+      <VenueMap
+        :height="320"
+        show-crowd
+        :alert-zone-ids="store.activeAlerts.filter(a => a.level !== 'low').map(a => a.zoneId)"
+        :diversion-channels="diversionMapLayers()"
+        :staff-roles="['usher', 'security']"
+        class="section-gap"
+      />
     </div>
 
     <div v-if="!store.activeIncidents.length" class="empty">
@@ -140,6 +189,8 @@ const mySelectedTasks = computed(() =>
                 show-crowd
                 :last-seen-zone-id="selected.lastSeenZoneId"
                 :intercept-zone-ids="activeExitIds"
+                :alert-zone-ids="store.activeAlerts.filter(a => a.level !== 'low').map(a => a.zoneId)"
+                :diversion-channels="diversionMapLayers()"
                 :staff-roles="['usher', 'security']"
               />
               <table class="tbl section-gap">

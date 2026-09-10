@@ -58,6 +58,27 @@ describe('六角色视图渲染冒烟测试', () => {
       lastSeenNote: '排队走散',
     })
 
+    // 场务确认家庭厕所拥挤 → 安保端临时分流通道渲染
+    const seatBAlert = store.activeAlerts.find((a) => a.zoneId === 'seat-b')!
+    store.alertCheck(seatBAlert.id, 'U3', 'toilet-family', true, '排队堵到通道')
+    expect(store.activeDiversions.length).toBe(1)
+
+    // 打开场务端"中场高风险预警"Tab 并渲染
+    role.switchView('usher')
+    await nextTick()
+    const alertTab = [...el.querySelectorAll('button')].find((b) => b.textContent?.includes('中场高风险预警'))
+    expect(alertTab).toBeTruthy()
+    alertTab!.dispatchEvent(new Event('click', { bubbles: true }))
+    await nextTick()
+    expect(el.textContent).toContain('中场休息高风险巡查优先级')
+    expect(el.textContent).toContain('确认拥挤并通知安保分流')
+
+    // 安保端渲染分流通道卡片
+    role.switchView('security')
+    await nextTick()
+    expect(el.textContent).toContain('临时分流通道')
+    expect(el.textContent).toContain('分流中')
+
     for (const r of ROLES) {
       role.switchView(r)
       await nextTick()

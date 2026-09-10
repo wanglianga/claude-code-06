@@ -357,6 +357,24 @@ table.tbl tr:last-child td { border-bottom: none; }
 .zone-box.intercept { fill: var(--critical-soft); stroke: var(--critical); stroke-width: 2.2; }
 .zone-box.last-seen { stroke: var(--critical); stroke-width: 2.6; stroke-dasharray: 5 3; }
 .zone-box.assigned { stroke: var(--info); stroke-width: 2.4; }
+.zone-box.alert-zone { stroke: var(--serious); stroke-width: 2.6; stroke-dasharray: 6 2.4; }
+.diversion-line {
+  stroke: var(--serious);
+  stroke-width: 2.2;
+  stroke-dasharray: 6 3;
+  fill: none;
+  animation: dash-flow 1s linear infinite;
+}
+@keyframes dash-flow {
+  to { stroke-dashoffset: -9; }
+}
+.diversion-label {
+  font-size: 7.5px;
+  fill: var(--serious);
+  font-weight: 700;
+  text-anchor: middle;
+  pointer-events: none;
+}
 .zone-label { font-size: 10.5px; fill: var(--ink-2); pointer-events: none; text-anchor: middle; font-weight: 600; }
 .zone-label.stage-label { fill: #fff; }
 .zone-sub { font-size: 9px; fill: var(--ink-3); pointer-events: none; text-anchor: middle; }

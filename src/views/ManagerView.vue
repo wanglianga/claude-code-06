@@ -69,8 +69,16 @@ function barHeight(count: number) {
   return Math.round((count / maxCount.value) * 110) + 6
 }
 
-const areaLabel: Record<string, string> = { staffing: '场务站位', toilet: '厕所引导', exit: '出口提示' }
-const areaCls: Record<string, string> = { staffing: 'pill-brand', toilet: 'pill-gold', exit: 'pill-critical' }
+const areaLabel: Record<string, string> = { staffing: '场务站位', toilet: '厕所引导', exit: '出口提示', signage: '临时指示牌' }
+const areaCls: Record<string, string> = { staffing: 'pill-brand', toilet: 'pill-gold', exit: 'pill-critical', signage: 'pill-serious' }
+
+const intermissionAlertRows = computed(() =>
+  store.activeAlerts.map((a) => ({
+    a,
+    zoneName: ZONES_BY_ID.get(a.zoneId)?.name ?? a.zoneId,
+    crowdedNames: a.crowdedZoneIds.map((z) => ZONES_BY_ID.get(z)?.shortName).join('、'),
+  }))
+)
 
 function broadcastAgain(id: string) {
   store.escalateBroadcast(id, '值班经理')
@@ -110,7 +118,57 @@ function broadcastAgain(id: string) {
         show-crowd
         :last-seen-zone-ids="lastSeenIds"
         :intercept-zone-ids="activeInterceptIds"
+        :alert-zone-ids="store.activeAlerts.filter(a => a.level !== 'low').map(a => a.zoneId)"
+        :diversion-channels="store.diversions.filter(d => d.active).map(d => ({ zoneId: d.zoneId, exitId: d.exitId, active: d.active }))"
       />
+    </div>
+
+    <!-- 中场高风险预警态势 -->
+    <div v-if="['intermission', 'exit'].includes(store.show.phase)" class="card">
+      <div class="card-title">
+        <h2>🚨 中场高风险预警与分流态势</h2>
+        <span class="hint">系统按儿童年龄/座位距出口/单人带娃/离座报备/厕所卖品拥堵给场务生成巡查优先级；被反复触发的区域会进入下一场排班与指示牌建议</span>
+      </div>
+      <div v-if="!intermissionAlertRows.length" class="empty">当前没有生效中的预警（均已解除或无已入场儿童）。</div>
+      <table v-else class="tbl">
+        <thead>
+          <tr><th>优先级</th><th>座位分区</th><th>分值</th><th>关联拥堵区</th><th>离座未归</th><th>场务确认拥挤</th><th>触发次数</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="{ a, zoneName, crowdedNames } in intermissionAlertRows" :key="a.id">
+            <td>
+              <span class="tag-pill" :class="a.level === 'high' ? 'pill-critical' : a.level === 'medium' ? 'pill-serious' : 'pill-gray'">
+                {{ { high: '高', medium: '中', low: '低' }[a.level] }}
+              </span>
+            </td>
+            <td><strong>{{ zoneName }}</strong></td>
+            <td class="mono">{{ a.score }}</td>
+            <td>{{ crowdedNames || '—' }}</td>
+            <td>
+              <span v-if="a.leftSeatChildIds.length" class="tag-pill pill-warn">{{ a.leftSeatChildIds.length }} 名</span>
+              <span v-else class="muted">—</span>
+            </td>
+            <td>
+              <span v-if="a.confirmCount" class="tag-pill pill-critical">{{ a.confirmCount }} 次</span>
+              <span v-else class="muted">未确认</span>
+            </td>
+            <td>
+              <strong :class="a.triggerCount >= 2 ? 'pill-gold tag-pill' : ''">{{ a.triggerCount }}</strong>
+              <span v-if="a.triggerCount >= 2" class="muted small-text"> → 影响下一场</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="store.activeDiversions.length" class="section-gap">
+        <h3 style="margin-bottom:6px">安保端临时分流通道（{{ store.activeDiversions.length }}）</h3>
+        <div v-for="d in store.activeDiversions" :key="d.id" class="list-row">
+          <span class="dot dot-critical"></span>
+          <span class="small-text">
+            <strong>{{ ZONES_BY_ID.get(d.zoneId)?.name }} → {{ ZONES_BY_ID.get(d.exitId)?.name }}</strong>
+            <span class="muted"> · {{ d.reason }}</span>
+          </span>
+        </div>
+      </div>
     </div>
 
     <!-- 处置中事件 -->
@@ -177,6 +235,19 @@ function broadcastAgain(id: string) {
             </div>
             <div>
               <strong>家长通知：</strong><span class="muted">{{ i.parentNotifyWay || '电话告知搜寻进展，App 推送' }}</span>
+            </div>
+            <div v-if="i.broughtAlertChecks.length">
+              <strong>带入的中场巡查记录：</strong>
+              <div class="small-text stack" style="gap:4px;margin-top:4px">
+                <div v-for="c in i.broughtAlertChecks" :key="c.id" class="list-row" style="align-items:flex-start">
+                  <span class="dot" :class="c.crowded ? 'dot-critical' : 'dot-good'" style="margin-top:5px"></span>
+                  <span class="small-text">
+                    {{ c.staffName }} 在{{ ZONES_BY_ID.get(c.zoneId)?.name }}
+                    <span :class="c.crowded ? 'tag-pill pill-critical' : 'tag-pill pill-good'" style="margin:0 4px">{{ c.crowded ? '确认拥挤' : '人流正常' }}</span>
+                    {{ c.note }}
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -252,7 +323,7 @@ function broadcastAgain(id: string) {
             <span class="dot dot-good"></span>
             <div class="small-text">
               <strong>调整项已对应到下一场执行清单：</strong>
-              场务站位（带位引导/巡查重心）、厕所排队引导（备用厕所与分段放行）、出口提示（提前 5 分钟屏幕提示 + 高风险家庭护送出闸）。
+              场务站位（带位引导/巡查重心/反复预警区提前到位）、厕所排队引导（备用厕所与分段放行）、出口提示（提前 5 分钟屏幕提示 + 高风险家庭护送出闸）、临时指示牌（反复拥堵区入口的排队方向/备用通道牌）。
             </div>
           </div>
         </div>

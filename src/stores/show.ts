@@ -2,11 +2,15 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
   buildBroadcast,
+  buildIntermissionAlerts,
   nearestStaff,
   parentNotifyWay,
+  planDiversions,
   planExitInterceptions,
   planSearchZones,
+  reconcileAlerts,
   reviewShow,
+  selectAlertSightings,
   verifyDeskCandidate,
 } from '@/domain/engine'
 import {
@@ -19,13 +23,16 @@ import {
   ZONES_BY_ID,
 } from '@/domain/seed'
 import type {
+  AlertCheck,
   AssignedTask,
   ChildProfile,
   CrowdLevel,
   CrowdReport,
   DeskCheck,
+  DiversionChannel,
   Incident,
   IncidentStatus,
+  IntermissionAlert,
   PatrolCheck,
   Show,
   ShowPhase,
@@ -34,13 +41,17 @@ import type {
 } from '@/domain/types'
 
 const STORAGE_KEY = 'theater-safety-v1'
+const STORAGE_VERSION = 2
 
 interface PersistShape {
+  version?: number
   show: Show
   children: ChildProfile[]
   staff: Staff[]
   crowdReports: CrowdReport[]
   incidents: Incident[]
+  alerts: IntermissionAlert[]
+  diversions: DiversionChannel[]
   seq: number
 }
 
@@ -70,6 +81,8 @@ export const useShowStore = defineStore('show', () => {
   const staff = ref<Staff[]>(buildStaff(now.value))
   const crowdReports = ref<CrowdReport[]>(buildCrowdReports(now.value))
   const incidents = ref<Incident[]>([])
+  const alerts = ref<IntermissionAlert[]>([])
+  const diversions = ref<DiversionChannel[]>([])
   const seq = ref(100)
 
   let timer: number | undefined
@@ -77,11 +90,14 @@ export const useShowStore = defineStore('show', () => {
   // ---------- 持久化 ----------
   function persist() {
     const data: PersistShape = {
+      version: STORAGE_VERSION,
       show: show.value,
       children: children.value,
       staff: staff.value,
       crowdReports: crowdReports.value,
       incidents: incidents.value,
+      alerts: alerts.value,
+      diversions: diversions.value,
       seq: seq.value,
     }
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
@@ -91,13 +107,21 @@ export const useShowStore = defineStore('show', () => {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return false
     try {
-      const data = JSON.parse(raw) as PersistShape
-      show.value = data.show
-      children.value = data.children
-      staff.value = data.staff
-      crowdReports.value = data.crowdReports
-      incidents.value = data.incidents
+      const data = JSON.parse(raw) as Partial<PersistShape>
+      show.value = data.show!
+      children.value = data.children!
+      staff.value = data.staff!
+      crowdReports.value = data.crowdReports!
+      incidents.value = data.incidents ?? []
+      alerts.value = data.alerts ?? []
+      diversions.value = data.diversions ?? []
       seq.value = data.seq ?? 100
+      // 兼容旧版持久化：缺少新字段的数据统一回到干净状态
+      if (data.version !== STORAGE_VERSION) {
+        incidents.value = []
+        alerts.value = []
+        diversions.value = []
+      }
       return true
     } catch {
       return false
@@ -112,6 +136,8 @@ export const useShowStore = defineStore('show', () => {
     staff.value = buildStaff(t)
     crowdReports.value = buildCrowdReports(t)
     incidents.value = []
+    alerts.value = []
+    diversions.value = []
     seq.value = 100
     persist()
   }
@@ -144,7 +170,60 @@ export const useShowStore = defineStore('show', () => {
     return incidents.value.find((i) => i.id === id)
   }
 
-  const review = computed(() => reviewShow(incidents.value))
+  const review = computed(() => reviewShow(incidents.value, alerts.value, ZONES_BY_ID))
+
+  // ---------- 中场休息高风险预警 ----------
+
+  /** 已入场儿童按座位分区聚合 */
+  const admittedChildrenBySeatZone = computed(() => {
+    const m = new Map<string, ChildProfile[]>()
+    for (const c of children.value) {
+      if (!c.admitted) continue
+      const seat = SEATS_BY_ID.get(c.seatId)
+      if (!seat) continue
+      const arr = m.get(seat.zoneId) ?? []
+      arr.push(c)
+      m.set(seat.zoneId, arr)
+    }
+    return m
+  })
+
+  /** 场务端可见的预警：中场/散场阶段，未被解除（高风险会自动复活） */
+  const activeAlerts = computed(() =>
+    alerts.value
+      .filter((a) => !a.dismissed && ['intermission', 'exit'].includes(show.value.phase))
+      .sort((a, b) => b.score - a.score)
+  )
+
+  /** 安保端临时分流通道 */
+  const activeDiversions = computed(() => diversions.value.filter((d) => d.active))
+
+  /** 全部预警巡查记录（用于报案时带入找回事件） */
+  const allAlertChecks = computed(() => alerts.value.flatMap((a) => a.checks))
+
+  function alertById(id: string) {
+    return alerts.value.find((a) => a.id === id)
+  }
+
+  /** 按当前儿童状态/拥堵上报重算预警，保留巡查历史与触发次数 */
+  function refreshAlerts() {
+    if (!['intermission', 'exit'].includes(show.value.phase)) return
+    const fresh = buildIntermissionAlerts(
+      ZONES,
+      admittedChildrenBySeatZone.value,
+      crowdReports.value,
+      show.value.id,
+      now.value
+    )
+    alerts.value = reconcileAlerts(alerts.value, fresh, now.value)
+    diversions.value = planDiversions({
+      alerts: alerts.value,
+      zones: ZONES,
+      existing: diversions.value,
+      showId: show.value.id,
+      now: now.value,
+    })
+  }
 
   // ---------- 工具 ----------
   function nextId(prefix: string) {
@@ -182,6 +261,7 @@ export const useShowStore = defineStore('show', () => {
     child.admitted = true
     child.admittedAt = now.value
     child.gateId = gateId
+    refreshAlerts()
     persist()
     return child
   }
@@ -189,8 +269,26 @@ export const useShowStore = defineStore('show', () => {
   // ---------- 阶段切换 ----------
   function setPhase(phase: ShowPhase) {
     show.value.phase = phase
+    // 进入中场休息：按儿童年龄/座位距出口/单人带娃/曾离座/功能区拥堵生成巡查优先级
+    if (phase === 'intermission') {
+      alerts.value = buildIntermissionAlerts(
+        ZONES,
+        admittedChildrenBySeatZone.value,
+        crowdReports.value,
+        show.value.id,
+        now.value
+      )
+      diversions.value = planDiversions({
+        alerts: alerts.value,
+        zones: ZONES,
+        existing: diversions.value,
+        showId: show.value.id,
+        now: now.value,
+      })
+    }
     // 进入散场：仍有未结事件 → 依据场务最后巡查位置重算出口拦截，并给安保派单
     if (phase === 'exit') {
+      refreshAlerts()
       for (const inc of activeIncidents.value) {
         applyExitInterceptions(inc, '演出进入散场阶段，系统按场务最后巡查位置重算出口拦截')
       }
@@ -202,8 +300,114 @@ export const useShowStore = defineStore('show', () => {
   function reportCrowd(zoneId: string, level: CrowdLevel, staffId: string) {
     const s = staffById(staffId)
     crowdReports.value.push({ zoneId, level, reportedBy: staffId, at: now.value })
+    // 拥堵变化会重算各座位分区的中场预警（周边厕所/卖品区因子）
+    refreshAlerts()
     for (const inc of activeIncidents.value) {
       log(inc, 'patrol', s?.name ?? '场务', `更新「${ZONES_BY_ID.get(zoneId)?.name}」拥挤度为 ${crowdText(level)}，搜寻优先级已重算`)
+    }
+    persist()
+  }
+
+  // ---------- 家长：中场报备孩子离座 ----------
+  function markTemporaryLeave(childId: string, note: string) {
+    const c = childById(childId)
+    if (!c) return
+    c.leftSeatAt = now.value
+    c.leftSeatNote = note
+    c.returnedAt = undefined
+    refreshAlerts()
+    persist()
+  }
+
+  /** 家长确认孩子已回座 */
+  function markReturned(childId: string) {
+    const c = childById(childId)
+    if (!c || !c.leftSeatAt) return
+    c.returnedAt = now.value
+    refreshAlerts()
+    persist()
+  }
+
+  // ---------- 场务：中场预警巡查反馈 ----------
+  /**
+   * 场务对预警区域巡查：
+   * - crowded=true 确认区域拥挤 → confirmCount+1，安保端出现临时分流通道；
+   * - crowded=false 到场查看人流正常 → 记录巡查，不触发分流。
+   * 所有记录都会在该区域儿童走失报案时自动带入找回事件。
+   */
+  function alertCheck(
+    alertId: string,
+    staffId: string,
+    zoneId: string,
+    crowded: boolean,
+    note: string
+  ): AlertCheck | undefined {
+    const alert = alertById(alertId)
+    const s = staffById(staffId)
+    if (!alert || !s) return undefined
+    const check: AlertCheck = {
+      id: nextId('AC'),
+      alertId,
+      zoneId,
+      staffId,
+      staffName: s.name,
+      at: now.value,
+      crowded,
+      note,
+    }
+    alert.checks.push(check)
+    s.zoneId = zoneId
+    s.lastPatrolAt[zoneId] = now.value
+    alert.updatedAt = now.value
+    if (crowded) {
+      alert.confirmCount += 1
+      alert.lastConfirmedAt = now.value
+    }
+    // 巡查后用最新状态重算评分（保留本次记录），分流通道随之生成/更新
+    const fresh = buildIntermissionAlerts(
+      ZONES,
+      admittedChildrenBySeatZone.value,
+      crowdReports.value,
+      show.value.id,
+      now.value
+    )
+    alerts.value = reconcileAlerts(alerts.value, fresh, now.value)
+    // reconcile 会用 fresh 覆盖 updatedAt，但 checks/confirmCount 已保留
+    diversions.value = planDiversions({
+      alerts: alerts.value,
+      zones: ZONES,
+      existing: diversions.value,
+      showId: show.value.id,
+      now: now.value,
+    })
+    persist()
+    return check
+  }
+
+  /** 场务查看后认为预警可解除；重新升至高风险时会自动复活 */
+  function dismissAlert(alertId: string, staffId: string) {
+    const alert = alertById(alertId)
+    const s = staffById(staffId)
+    if (!alert) return
+    alert.dismissed = true
+    alert.updatedAt = now.value
+    for (const inc of activeIncidents.value) {
+      log(inc, 'patrol', s?.name ?? '场务', `中场预警「${ZONES_BY_ID.get(alert.zoneId)?.name}」经现场查看后解除`)
+    }
+    persist()
+  }
+
+  // ---------- 安保：临时分流通道 ----------
+  /** 安保确认疏导完成，关闭临时分流通道 */
+  function closeDiversion(diversionId: string, note: string, staffId: string) {
+    const d = diversions.value.find((x) => x.id === diversionId)
+    const s = staffById(staffId)
+    if (!d) return
+    d.active = false
+    d.closedAt = now.value
+    d.closeNote = note
+    for (const inc of activeIncidents.value) {
+      log(inc, 'security', s?.name ?? '安保', `临时分流通道关闭（${ZONES_BY_ID.get(d.zoneId)?.shortName}→${ZONES_BY_ID.get(d.exitId)?.shortName}）：${note}`)
     }
     persist()
   }
@@ -262,6 +466,7 @@ export const useShowStore = defineStore('show', () => {
       tasks: [],
       patrolChecks: [],
       deskChecks: [],
+      broughtAlertChecks: [],
       interceptions: [],
       cctvRequested: false,
       policeCalled: false,
@@ -275,9 +480,27 @@ export const useShowStore = defineStore('show', () => {
       `家长在${stageText(stage)}报案：${child.nickname}（${child.age}岁，${child.topColor}上装/${child.bottomColor}下装）最后出现于${ZONES_BY_ID.get(payload.lastSeenZoneId)?.name}，座位 ${seat?.id ?? child.seatId}。${payload.lastSeenNote}`
     )
 
-    // 1) 搜寻分区：座位 + 最后位置 + 拥挤功能区 + 出口
+    // 1) 搜寻分区：座位 + 最后位置 + 拥挤功能区 + 出口；带入中场预警巡查记录收窄最后出现范围
     const lastSeenZone = ZONES_BY_ID.get(payload.lastSeenZoneId)!
-    const plan = planSearchZones(ZONES, lastSeenZone, crowdReports.value, now.value)
+    const sightings = selectAlertSightings(allAlertChecks.value, ZONES_BY_ID, lastSeenZone, now.value)
+    incident.broughtAlertChecks = sightings
+    if (sightings.length) {
+      const crowdedNames = [
+        ...new Set(
+          sightings
+            .filter((c) => c.crowded)
+            .map((c) => ZONES_BY_ID.get(c.zoneId)?.shortName)
+        ),
+      ].filter(Boolean)
+      log(
+        incident,
+        'system',
+        '协同系统',
+        `带入中场巡查记录 ${sightings.length} 条（场务：${[...new Set(sightings.map((c) => c.staffName))].join('、')}），` +
+          `最后出现范围收窄至最后位置周边${crowdedNames.length ? `，重点关注曾确认拥挤的：${crowdedNames.join('、')}` : ''}。`
+      )
+    }
+    const plan = planSearchZones(ZONES, lastSeenZone, crowdReports.value, now.value, sightings)
     const searchZones = plan.slice(0, 6).map((p) => p.zone)
 
     // 2) 派最近的两名空闲场务，主攻分区不同
@@ -636,6 +859,14 @@ export const useShowStore = defineStore('show', () => {
         '值班经理'
       )
     }
+    // 分流通道随演出结束全部关闭；预警记录保留（triggerCount 用于复盘）
+    for (const d of diversions.value) {
+      if (d.active) {
+        d.active = false
+        d.closedAt = now.value
+        d.closeNote = '演出结束，临时分流通道撤除'
+      }
+    }
     persist()
   }
 
@@ -647,6 +878,8 @@ export const useShowStore = defineStore('show', () => {
     staff,
     crowdReports,
     incidents,
+    alerts,
+    diversions,
     // lifecycle
     restore,
     resetDemo,
@@ -657,15 +890,24 @@ export const useShowStore = defineStore('show', () => {
     activeIncidents,
     closedIncidents,
     review,
+    activeAlerts,
+    activeDiversions,
+    allAlertChecks,
     childById,
     staffById,
     incidentById,
+    alertById,
     // actions
     registerChild,
     admitByOrder,
     setPhase,
     reportCrowd,
     moveStaff,
+    markTemporaryLeave,
+    markReturned,
+    alertCheck,
+    dismissAlert,
+    closeDiversion,
     reportMissing,
     acceptTask,
     reassignTask,

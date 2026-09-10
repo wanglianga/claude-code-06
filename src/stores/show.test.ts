@@ -193,6 +193,77 @@ describe('show store 端到端协同流', () => {
     expect(inc.status).toBe('reunited')
   })
 
+  it('中场高风险预警 → 确认拥挤同步分流 → 报案带入巡查记录 → 反复触发影响下一场排班与指示牌', () => {
+    const store = useShowStore()
+    // 核验全部儿童并进入中场
+    for (const c of store.children) store.admitByOrder(c.orderNo, 'gate')
+    store.setPhase('intermission')
+
+    // 1) 进入中场即按五因子生成座位分区预警，B 区紧邻被报高拥堵的家庭厕所 → 高风险
+    expect(store.activeAlerts.length).toBeGreaterThan(0)
+    const alertB = store.activeAlerts.find((a) => a.zoneId === 'seat-b')!
+    expect(alertB).toBeTruthy()
+    expect(alertB.level).toBe('high')
+    expect(alertB.crowdedZoneIds).toContain('toilet-family')
+    expect(alertB.factors.join('|')).toMatch(/年龄|单人|出口|人流/)
+
+    // 2) 家长为豆包(A 区)报备临时离座 → A 区预警升级
+    const doubao = store.children.find((c) => c.nickname === '豆包')!
+    const alertABefore = store.activeAlerts.find((a) => a.zoneId === 'seat-a')!
+    store.markTemporaryLeave(doubao.id, '自己去卖品区买水')
+    const alertAAfter = store.activeAlerts.find((a) => a.zoneId === 'seat-a')!
+    expect(alertAAfter.score).toBeGreaterThan(alertABefore.score)
+    expect(alertAAfter.leftSeatChildIds).toContain(doubao.id)
+
+    // 3) 场务确认 B 区关联的家庭厕所拥挤 → 安保端出现临时分流通道（指向最近的东出口）
+    expect(store.activeDiversions).toHaveLength(0)
+    store.alertCheck(alertB.id, 'U3', 'toilet-family', true, '家庭厕所排队堵到通道，建议分流')
+    expect(store.activeDiversions).toHaveLength(1)
+    const div = store.activeDiversions[0]
+    expect(div.zoneId).toBe('toilet-family')
+    expect(div.exitId).toBe('exit-east')
+    const refreshedB = store.activeAlerts.find((a) => a.zoneId === 'seat-b')!
+    expect(refreshedB.confirmCount).toBe(1)
+    expect(refreshedB.checks).toHaveLength(1)
+
+    // 4) 家长随后报案（小糯米，B 区，最后出现于家庭厕所）→ 中场巡查记录被带入找回事件
+    const nuomi = store.children.find((c) => c.nickname === '小糯米')!
+    const inc = store.reportMissing({
+      childId: nuomi.id,
+      reportedBy: '张伟',
+      reporterPhone: '13800000002',
+      lastSeenZoneId: 'toilet-family',
+      lastSeenNote: '排队上厕所时冲散',
+    })
+    expect(inc.broughtAlertChecks.length).toBeGreaterThanOrEqual(1)
+    expect(inc.broughtAlertChecks.some((c) => c.crowded && c.zoneId === 'toilet-family')).toBe(true)
+    // 时间线可看到"带入中场巡查记录、收窄最后出现范围"
+    expect(inc.timeline.some((e) => e.text.includes('带入中场巡查记录'))).toBe(true)
+    // 搜寻计划中家庭厕所排第一（最后出现 + 确认拥挤加权）
+    expect(inc.tasks[0].zoneIds).toContain('toilet-family')
+
+    // 5) 安保关闭分流通道
+    store.closeDiversion(div.id, '已加开备用通道，人流回落', 'S1')
+    expect(store.activeDiversions).toHaveLength(0)
+
+    // 6) 预警反复触发：家庭厕所人流回落后 B 区降级（低龄/单人带娃仍为中），再次报拥挤重新升高 → 触发次数累计
+    const levelBefore = store.alerts.find((a) => a.zoneId === 'seat-b')!.level
+    store.reportCrowd('toilet-family', 'low', 'U3')
+    expect(store.alerts.find((a) => a.zoneId === 'seat-b')!.level).not.toBe(levelBefore)
+    store.reportCrowd('toilet-family', 'high', 'U3')
+    const hotB = store.alerts.find((a) => a.zoneId === 'seat-b')!
+    expect(hotB.level).toBe('high')
+    expect(hotB.triggerCount).toBeGreaterThanOrEqual(2)
+
+    // 7) 散场结束复盘：出现下一场排班 + 临时指示牌位置建议
+    store.setPhase('exit')
+    store.closeShow()
+    const areas = store.review.suggestions.map((s) => s.area)
+    expect(areas).toContain('staffing')
+    expect(areas).toContain('signage')
+    expect(store.review.suggestions.find((s) => s.area === 'signage')!.text).toContain('家庭厕所')
+  })
+
   it('任务人员忙碌时支持改派给最近空闲人员', () => {
     const store = useShowStore()
     store.setPhase('intermission')

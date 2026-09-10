@@ -21,7 +21,7 @@ if (!role.staffId || !ushers.value.some((u) => u.id === role.staffId)) {
 }
 const me = computed(() => store.staffById(role.staffId)!)
 
-const tab = ref<'seats' | 'patrol' | 'tasks'>('seats')
+const tab = ref<'seats' | 'alerts' | 'patrol' | 'tasks'>('seats')
 const seatZoneId = ref('seat-a')
 
 // ---------- 分区座位 ----------
@@ -49,6 +49,64 @@ const crowdClass: Record<CrowdLevel, string> = { low: 'pill-good', medium: 'pill
 function setCrowd(zoneId: string, level: CrowdLevel) {
   store.reportCrowd(zoneId, level, role.staffId)
   toast.push(`已上报「${ZONES_BY_ID.get(zoneId)?.name}」拥挤度：${crowdText[level]}`)
+}
+
+// ---------- 中场休息高风险预警 ----------
+const intermissionAlerts = computed(() =>
+  store.activeAlerts.map((a) => ({
+    a,
+    children: a.childIds.map((id) => store.childById(id)!).filter(Boolean),
+    latestCheck: [...a.checks].sort((x, y) => y.at - x.at)[0],
+  }))
+)
+const alertLevelMeta = {
+  high: { cls: 'pill-critical', text: '高风险·立即巡查' },
+  medium: { cls: 'pill-serious', text: '中风险·优先巡查' },
+  low: { cls: 'pill-gray', text: '低风险·常规关注' },
+} as const
+
+const alertForms = ref<Record<string, { zoneId: string; crowded: boolean; note: string }>>({})
+function alertFormOf(alertId: string, crowdedZoneIds: string[], zoneId: string) {
+  if (!alertForms.value[alertId]) {
+    alertForms.value[alertId] = {
+      zoneId: crowdedZoneIds[0] ?? zoneId,
+      crowded: true,
+      note: '',
+    }
+  }
+  return alertForms.value[alertId]
+}
+
+function submitAlertCheck(alertId: string) {
+  const a = store.alertById(alertId)!
+  const f = alertFormOf(alertId, a.crowdedZoneIds, a.zoneId)
+  // 重算后关联拥堵区可能变化，失效的旧选择回落到当前首个拥堵区/座位分区
+  if (![a.zoneId, ...a.crowdedZoneIds].includes(f.zoneId)) {
+    f.zoneId = a.crowdedZoneIds[0] ?? a.zoneId
+  }
+  if (!f.note.trim()) return toast.push('请填写巡查说明（人流情况与现场处置）', 'critical')
+  store.alertCheck(alertId, role.staffId, f.zoneId, f.crowded, f.note.trim())
+  if (f.crowded) {
+    toast.push('已确认区域拥挤，临时分流通道已同步给安保端', 'critical', 5200)
+  } else {
+    toast.push('巡查记录已提交，人流可接受')
+  }
+  f.note = ''
+}
+
+function clearAlert(alertId: string) {
+  store.dismissAlert(alertId, role.staffId)
+  toast.push('该预警已解除（重新升至高风险会自动恢复）')
+}
+
+const alertZoneIds = computed(() => new Set(store.activeAlerts.filter((a) => a.level !== 'low').map((a) => a.zoneId)))
+const diversionChannels = computed(() =>
+  store.diversions
+    .filter((d) => d.active)
+    .map((d) => ({ zoneId: d.zoneId, exitId: d.exitId, active: d.active }))
+)
+function zoneName(id: string) {
+  return ZONES_BY_ID.get(id)?.name ?? id
 }
 
 function goPatrol(zoneId: string, incidentId?: string) {
@@ -113,6 +171,9 @@ const foundZoneIds = computed(() =>
       <span class="muted small-text">当前位置：{{ ZONES_BY_ID.get(me.zoneId)?.name }}</span>
       <span style="flex:1"></span>
       <button class="ghost small" :class="{ 'pill-brand': tab === 'seats' }" @click="tab = 'seats'">分区座位与高风险</button>
+      <button class="ghost small" :class="{ 'pill-brand': tab === 'alerts' }" @click="tab = 'alerts'">
+        🚨 中场高风险预警<span v-if="intermissionAlerts.filter(x => x.a.level !== 'low').length" class="tag-pill pill-critical" style="margin-left:6px">{{ intermissionAlerts.filter(x => x.a.level !== 'low').length }}</span>
+      </button>
       <button class="ghost small" :class="{ 'pill-brand': tab === 'patrol' }" @click="tab = 'patrol'">
         中场巡查{{ store.show.phase === 'intermission' ? '（当前阶段）' : '' }}
       </button>
@@ -204,6 +265,105 @@ const foundZoneIds = computed(() =>
           </div>
         </div>
       </div>
+    </template>
+
+    <!-- TAB: 中场高风险预警 -->
+    <template v-if="tab === 'alerts'">
+      <div v-if="!['intermission', 'exit'].includes(store.show.phase)" class="empty">
+        中场高风险预警在值班经理把演出推进到「中场休息」后生成；评分综合儿童年龄、座位距出口、单人带娃、家长报备离座与厕所/卖品区拥堵情况。
+      </div>
+      <template v-else>
+        <div class="card tight" style="border-color:#e7c8c8">
+          <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+            <span style="font-size:18px">🚨</span>
+            <strong>中场休息高风险巡查优先级</strong>
+            <span class="tag-pill pill-critical">{{ intermissionAlerts.filter((x) => x.a.level === 'high').length }} 高</span>
+            <span class="tag-pill pill-serious">{{ intermissionAlerts.filter((x) => x.a.level === 'medium').length }} 中</span>
+            <span class="muted small-text">按综合分排序；确认拥挤后安保端会同步出现临时分流通道，巡查记录将在家长报案时自动带入找回事件。</span>
+          </div>
+        </div>
+
+        <div v-for="{ a, children, latestCheck } in intermissionAlerts" :key="a.id" class="card" :class="a.level === 'high' ? 'pulse' : ''" :style="a.level === 'high' ? 'border-color:#e7c8c8' : ''">
+          <div class="card-title">
+            <h2>{{ zoneName(a.zoneId) }}</h2>
+            <span class="tag-pill" :class="alertLevelMeta[a.level].cls">{{ alertLevelMeta[a.level].text }}</span>
+            <span class="tag-pill pill-gray">优先级分 {{ a.score }}</span>
+            <span v-if="a.confirmCount" class="tag-pill pill-serious">已确认拥挤 ×{{ a.confirmCount }}</span>
+            <span v-if="a.triggerCount >= 2" class="tag-pill pill-gold">本场反复预警 ×{{ a.triggerCount }}（影响下一场排班/指示牌）</span>
+            <span class="spacer"></span>
+            <button class="ghost small" @click="clearAlert(a.id)">现场无异常，解除预警</button>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <h3 style="margin-bottom:6px">评分依据</h3>
+              <div v-for="(f, idx) in a.factors" :key="idx" class="list-row" style="align-items:flex-start">
+                <span class="dot" :class="a.level === 'high' ? 'dot-critical' : 'dot-warn'" style="margin-top:5px"></span>
+                <span class="small-text">{{ f }}</span>
+              </div>
+              <div v-if="!a.factors.length" class="muted small-text">该分区暂无额外风险因子。</div>
+
+              <h3 class="section-gap" style="margin-bottom:6px">分区内儿童（{{ children.length }}）</h3>
+              <div class="row" style="gap:6px;flex-wrap:wrap">
+                <span v-for="c in children" :key="c.id" class="tag-pill" :class="c.age <= 4 ? 'pill-critical' : c.age <= 6 ? 'pill-gold' : 'pill-gray'">
+                  {{ c.nickname }}·{{ c.age }}岁{{ c.guardians.length <= 1 ? '·单人带娃' : '' }}{{ c.leftSeatAt && !c.returnedAt ? '·离座未归' : '' }}
+                </span>
+              </div>
+            </div>
+
+            <div>
+              <VenueMap
+                :height="260"
+                show-crowd
+                :alert-zone-ids="[...alertZoneIds]"
+                :diversion-channels="diversionChannels"
+                :staff-roles="['usher']"
+              />
+
+              <div class="section-gap">
+                <label>巡查区域</label>
+                <select v-model="alertFormOf(a.id, a.crowdedZoneIds, a.zoneId).zoneId" style="margin-bottom:8px">
+                  <option :value="a.zoneId">{{ zoneName(a.zoneId) }}（座位分区巡查）</option>
+                  <option v-for="zid in a.crowdedZoneIds" :key="zid" :value="zid">{{ zoneName(zid) }}（预警关联功能区）</option>
+                </select>
+                <label class="switch-row" style="margin-bottom:8px">
+                  <input type="checkbox" v-model="alertFormOf(a.id, a.crowdedZoneIds, a.zoneId).crowded" />
+                  <span>
+                    <span class="t">{{ alertFormOf(a.id, a.crowdedZoneIds, a.zoneId).crowded ? '确认该区域拥挤，需要安保临时分流' : '到场查看，人流可接受' }}</span>
+                    <span class="d" style="display:block">确认拥挤会同步推送分流通道到安保端</span>
+                  </span>
+                </label>
+                <textarea
+                  v-model="alertFormOf(a.id, a.crowdedZoneIds, a.zoneId).note"
+                  rows="2"
+                  :placeholder="alertFormOf(a.id, a.crowdedZoneIds, a.zoneId).crowded ? '如：家庭厕所排队堵到通道，已有儿童与家长被冲散，建议分流东出口' : '如：队列为正常排队，未发现独行儿童'"
+                ></textarea>
+                <div class="row" style="margin-top:8px">
+                  <button :class="alertFormOf(a.id, a.crowdedZoneIds, a.zoneId).crowded ? 'danger' : 'good'" @click="submitAlertCheck(a.id)">
+                    {{ alertFormOf(a.id, a.crowdedZoneIds, a.zoneId).crowded ? '确认拥挤并通知安保分流' : '提交巡查记录' }}
+                  </button>
+                </div>
+              </div>
+
+              <div v-if="a.checks.length" class="section-gap">
+                <h3 style="margin-bottom:6px">巡查记录（{{ a.checks.length }}）</h3>
+                <div v-for="c in [...a.checks].reverse().slice(0, 4)" :key="c.id" class="list-row" style="align-items:flex-start">
+                  <span class="dot" :class="c.crowded ? 'dot-critical' : 'dot-good'" style="margin-top:5px"></span>
+                  <div class="small-text">
+                    <strong>{{ c.staffName }}</strong> 在{{ zoneName(c.zoneId) }}
+                    <span :class="c.crowded ? 'tag-pill pill-critical' : 'tag-pill pill-good'" style="margin:0 4px">
+                      {{ c.crowded ? '确认拥挤' : '人流正常' }}
+                    </span>
+                    {{ c.note }}
+                    <div class="muted mono" style="font-size:10.5px">{{ formatTime(c.at) }}</div>
+                  </div>
+                </div>
+                <div v-if="latestCheck" class="muted small-text">最近巡查：{{ formatTime(latestCheck.at) }}（{{ latestCheck.staffName }}）</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
     </template>
 
     <!-- TAB: 中场巡查 -->
@@ -318,6 +478,8 @@ const foundZoneIds = computed(() =>
               :last-seen-zone-id="i.lastSeenZoneId"
               :assigned-zone-ids="[...assignedZoneIds]"
               :found-zone-ids="[...foundZoneIds]"
+              :alert-zone-ids="[...alertZoneIds]"
+              :diversion-channels="diversionChannels"
               :staff-roles="['usher', 'security']"
             />
             <div class="section-gap">

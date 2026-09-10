@@ -13,6 +13,8 @@ const props = withDefaults(
     interceptZoneIds?: string[]
     assignedZoneIds?: string[]
     foundZoneIds?: string[]
+    alertZoneIds?: string[]
+    diversionChannels?: { zoneId: string; exitId: string; active: boolean }[]
     staffRoles?: StaffRole[]
     selectable?: boolean
     height?: number
@@ -24,6 +26,8 @@ const props = withDefaults(
     interceptZoneIds: () => [],
     assignedZoneIds: () => [],
     foundZoneIds: () => [],
+    alertZoneIds: () => [],
+    diversionChannels: () => [],
     staffRoles: () => ['usher', 'security', 'desk'],
     selectable: false,
     height: 460,
@@ -74,10 +78,39 @@ function zoneClass(rz: RenderZone) {
     `type-${rz.z.type}`,
     props.showCrowd && rz.z.type === 'facility' ? `crowd-${crowdOf(rz.z)}` : '',
     props.interceptZoneIds.includes(rz.z.id) ? 'intercept' : '',
+    props.alertZoneIds.includes(rz.z.id) ? 'alert-zone' : '',
     props.lastSeenZoneId === rz.z.id || props.lastSeenZoneIds.includes(rz.z.id) ? 'last-seen' : '',
     props.assignedZoneIds.includes(rz.z.id) ? 'assigned' : '',
   ].join(' ')
 }
+
+/** 临时分流通道箭头：拥堵功能区 → 建议出口 */
+const diversionArrows = computed(() =>
+  props.diversionChannels
+    .filter((d) => d.active)
+    .map((d) => {
+      const from = ZONES.find((z) => z.id === d.zoneId)
+      const to = ZONES.find((z) => z.id === d.exitId)
+      if (!from || !to) return undefined
+      // 缩短起止，避免箭头压进方块
+      const dx = to.x - from.x
+      const dy = to.y - from.y
+      const len = Math.hypot(dx, dy) || 1
+      const ux = dx / len
+      const uy = dy / len
+      const gap = 7
+      return {
+        id: `${d.zoneId}-${d.exitId}`,
+        x1: from.x + ux * gap,
+        y1: from.y + uy * gap,
+        x2: to.x - ux * (gap + 2),
+        y2: to.y - uy * (gap + 2),
+        labelX: (from.x + to.x) / 2,
+        labelY: (from.y + to.y) / 2 - 1.6,
+      }
+    })
+    .filter((x): x is NonNullable<typeof x> => !!x)
+)
 
 /** 同区域人员扇形展开，避免重叠 */
 const markerPositions = computed(() => {
@@ -105,6 +138,11 @@ const crowdLabel: Record<string, string> = { low: '畅通', medium: '较挤', hi
 <template>
   <div>
     <svg class="venue-map" :viewBox="`0 0 100 100`" :style="{ height: height + 'px' }" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <marker id="arrow-diversion" markerWidth="5" markerHeight="5" refX="3.2" refY="2" orient="auto">
+          <path d="M0,0 L4,2 L0,4 Z" fill="var(--serious)" />
+        </marker>
+      </defs>
       <!-- 区域 -->
       <g v-for="rz in rendered" :key="rz.z.id">
         <rect
@@ -137,6 +175,18 @@ const crowdLabel: Record<string, string> = { low: '畅通', medium: '较挤', hi
         </text>
       </g>
 
+      <!-- 临时分流通道 -->
+      <g class="diversion-layer">
+        <template v-for="a in diversionArrows" :key="a.id">
+          <line
+            :x1="a.x1" :y1="a.y1" :x2="a.x2" :y2="a.y2"
+            class="diversion-line"
+            :marker-end="'url(#arrow-diversion)'"
+          />
+          <text :x="a.labelX" :y="a.labelY" text-anchor="middle" class="diversion-label">分流</text>
+        </template>
+      </g>
+
       <!-- 人员位置 -->
       <g class="map-marker">
         <template v-for="(m, i) in markerPositions" :key="i">
@@ -154,6 +204,8 @@ const crowdLabel: Record<string, string> = { low: '畅通', medium: '较挤', hi
       <span class="chip"><span class="sw" style="background:var(--critical-soft);border-color:var(--critical)"></span>拦截出口</span>
       <span class="chip"><span class="sw" style="border:2.4px dashed var(--critical)"></span>最后出现</span>
       <span class="chip"><span class="sw" style="border:2.4px solid var(--info)"></span>搜寻分区</span>
+      <span class="chip"><span class="sw" style="border:2.4px dashed var(--serious)"></span>中场预警区</span>
+      <span class="chip"><span class="sw" style="border-top:2.4px dashed var(--serious);width:16px;height:2px"></span>临时分流</span>
       <span class="chip">
         <span style="display:inline-flex;gap:3px">
           <span style="width:12px;height:12px;border-radius:50%;background:#2a78d6;color:#fff;font-size:8px;text-align:center;line-height:12px">务</span>

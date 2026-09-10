@@ -149,6 +149,24 @@ function submitReport() {
   report.note = ''
 }
 
+// ---------- 中场临时离座报备 ----------
+const showLeave = ref(false)
+const leaveNote = ref('')
+
+function submitLeave() {
+  if (!myChild.value) return
+  if (!leaveNote.value.trim()) return toast.push('请简单说明去向（如上厕所、去卖品区）', 'critical')
+  store.markTemporaryLeave(myChild.value.id, leaveNote.value.trim())
+  toast.push('已报备孩子临时离座，场务中场预警将重点关注该区域', 'good', 4600)
+  leaveNote.value = ''
+  showLeave.value = false
+}
+function submitReturned() {
+  if (!myChild.value) return
+  store.markReturned(myChild.value.id)
+  toast.push('已确认孩子回座，预警已更新', 'good')
+}
+
 const phaseHint = computed(() => {
   switch (store.show.phase) {
     case 'entry': return '当前为入场阶段'
@@ -387,6 +405,43 @@ const phaseHint = computed(() => {
             </div>
           </template>
         </div>
+      </div>
+
+      <!-- 中场临时离座报备：喂给场务高风险预警 -->
+      <div
+        v-if="myChild.admitted && ['intermission', 'performance'].includes(store.show.phase)"
+        class="card"
+        :class="myChild.leftSeatAt && !myChild.returnedAt ? 'pulse' : ''"
+        style="border-color:#e9d8b8"
+      >
+        <div class="card-title">
+          <h2>🚻 中场临时离座报备</h2>
+          <span class="hint">报备后该座位分区的中场预警会提级，场务优先巡查孩子去向附近的厕所/卖品区；一旦报案，这些巡查记录会自动带入找回事件</span>
+        </div>
+        <template v-if="myChild.leftSeatAt && !myChild.returnedAt">
+          <div class="list-row danger">
+            <span class="dot dot-critical"></span>
+            <div class="small-text" style="flex:1">
+              <strong>{{ myChild.nickname }} 已离座 {{ minutesAgo(myChild.leftSeatAt, now) }} 分钟</strong>
+              <div class="muted">去向：{{ myChild.leftSeatNote }} · 报备时间 {{ formatTime(myChild.leftSeatAt) }}</div>
+            </div>
+            <button class="good" @click="submitReturned">孩子已回座</button>
+          </div>
+        </template>
+        <template v-else>
+          <div v-if="myChild.returnedAt" class="small-text muted" style="margin-bottom:8px">
+            ✓ 上次离座已于 {{ formatTime(myChild.returnedAt) }} 确认回座。
+          </div>
+          <button v-if="!showLeave" class="ghost" @click="showLeave = !showLeave">孩子临时离开座位（上厕所/买东西），点此报备</button>
+          <div v-else class="stack section-gap">
+            <label>简单说明去向 *</label>
+            <input v-model="leaveNote" placeholder="如：自己去家庭厕所，说好在门口等" />
+            <div class="row">
+              <button @click="submitLeave">提交报备</button>
+              <button class="ghost" @click="showLeave = false">取消</button>
+            </div>
+          </div>
+        </template>
       </div>
 
       <!-- 找回进展时间线（家长可见版） -->

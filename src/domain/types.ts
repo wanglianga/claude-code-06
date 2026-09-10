@@ -81,6 +81,83 @@ export interface ChildProfile {
   admitted: boolean
   admittedAt?: number
   gateId?: string
+  /** 中场休息家长报备：孩子曾离开座位（如厕/买东西等），尚未返回 */
+  leftSeatAt?: number
+  leftSeatNote?: string
+  returnedAt?: number
+}
+
+// ============ 中场休息高风险预警 ============
+
+/** 预警等级：分值 ≥24 高 / ≥14 中 / 其余低 */
+export type AlertLevel = 'low' | 'medium' | 'high'
+
+/** 场务对预警区域的巡查反馈（同时是后续找回事件的"巡查记录"来源） */
+export interface AlertCheck {
+  id: string
+  alertId: string
+  zoneId: string
+  staffId: string
+  staffName: string
+  at: number
+  /** true=确认区域拥挤（触发安保临时分流）；false=到场查看，人流可接受 */
+  crowded: boolean
+  note: string
+}
+
+/**
+ * 中场休息高风险预警：按"座位分区"聚合该区域已入场儿童的风险因子
+ * （儿童年龄、座位距出口远近、是否单人带娃、是否曾离座）与功能区拥堵情况，
+ * 给场务生成巡查优先级。
+ */
+export interface IntermissionAlert {
+  id: string
+  showId: string
+  /** 预警锚定的座位分区 */
+  zoneId: string
+  level: AlertLevel
+  /** 综合优先级分（越高越优先巡查） */
+  score: number
+  /** 逐条可解释的加分因子 */
+  factors: string[]
+  /** 构成预警的儿童 id */
+  childIds: string[]
+  /** 周边被纳入拥堵考量的功能区/出口 id */
+  crowdedZoneIds: string[]
+  /** 最拥堵周边的人流等级 */
+  crowdLevel: CrowdLevel
+  /** 被家长报备"曾离座"的儿童 id */
+  leftSeatChildIds: string[]
+  /** 场务确认拥挤的次数（推动安保分流） */
+  confirmCount: number
+  /** 累计触发（生成/仍为中高风险）次数，用于下一场排班与指示牌 */
+  triggerCount: number
+  /** 场务巡查反馈 */
+  checks: AlertCheck[]
+  /** 最近一次"确认拥挤"的时间 */
+  lastConfirmedAt?: number
+  /** 场务人工解除（查看后认为无需再预警） */
+  dismissed: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+/** 安保端临时分流通道：场务确认区域拥挤后生成，散场或人工确认后解除 */
+export interface DiversionChannel {
+  id: string
+  showId: string
+  /** 拥堵源（功能区） */
+  zoneId: string
+  /** 分流引导前往的出口/通道 */
+  exitId: string
+  reason: string
+  /** 触发该通道的预警 id */
+  alertId: string
+  active: boolean
+  createdAt: number
+  /** 安保确认疏导完成 / 人流回落的时间 */
+  closedAt?: number
+  closeNote?: string
 }
 
 // ============ 工作人员 ============
@@ -209,6 +286,8 @@ export interface Incident {
   tasks: AssignedTask[]
   patrolChecks: PatrolCheck[]
   deskChecks: DeskCheck[]
+  /** 报案时自动带入的中场预警巡查记录（用于缩小"最后出现范围"） */
+  broughtAlertChecks: AlertCheck[]
   interceptions: ExitInterception[]
   broadcast?: BroadcastRecord
   cctvRequested: boolean
@@ -231,7 +310,8 @@ export interface StageStat {
 
 export interface ReviewSuggestion {
   id: string
-  area: 'staffing' | 'toilet' | 'exit'
+  /** staffing=场务排班/站位 toilet=厕所排队引导 exit=出口提示 signage=临时指示牌 */
+  area: 'staffing' | 'toilet' | 'exit' | 'signage'
   text: string
   basedOn: string
 }
